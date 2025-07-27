@@ -1,0 +1,154 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from PIL import Image
+from torchvision import transforms, models
+import os
+
+# Set the device to GPU if available, otherwise use CPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# --- 1. Load and Preprocess Images ---
+def load_image(image_path, size=512):
+    """Loads and preprocesses an image for the model."""
+    image = Image.open(image_path)
+    # Resize to the specified size, maintaining aspect ratio
+    loader = transforms.Compose([
+        transforms.Resize(size),
+        transforms.ToTensor()
+    ])
+    image = loader(image).unsqueeze(0)
+    return image.to(device, torch.float)
+
+# --- 2. Define the Neural Style Transfer Model ---
+class VGG_Features(nn.Module):
+    """
+    A class to extract features from specific layers of a VGG-19 model.
+    """
+    def __init__(self, style_layers, content_layers):
+        super(VGG_Features, self).__init__()
+        self.vgg = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features.to(device).eval()
+        self.style_layers = style_layers
+        self.content_layers = content_layers
+
+    def forward(self, x):
+        style_features = []
+        content_features = []
+        
+        # Iterate through the VGG layers
+        for i, layer in enumerate(self.vgg):
+            x = layer(x)
+            
+            if i in self.style_layers:
+                style_features.append(x)
+            if i in self.content_layers:
+                content_features.append(x)
+                
+        return style_features, content_features
+
+# --- 3. Implement the Loss Functions ---
+def gram_matrix(input_tensor):
+    """Calculates the Gram matrix for style loss."""
+    batch_size, num_channels, height, width = input_tensor.size()
+    features = input_tensor.view(batch_size, num_channels, height * width)
+    G = torch.bmm(features, features.transpose(1, 2))
+    return G.div(num_channels * height * width)
+
+# --- 4. Main Training Loop ---
+def style_transfer(content_path, style_path, num_steps=300, style_weight=1e6, content_weight=1):
+    """
+    Performs Neural Style Transfer.
+    
+    Args:
+        content_path (str): Path to the content image.
+        style_path (str): Path to the style image.
+        num_steps (int): Number of optimization steps.
+        style_weight (float): Weight for the style loss.
+        content_weight (float): Weight for the content loss.
+    """
+    # Load images
+    content_img = load_image(content_path)
+    style_img = load_image(style_path)
+
+    # Initialize the generated image (start with a copy of the content image)
+    generated_img = content_img.clone().requires_grad_(True)
+    
+    # Define layers to use for content and style loss
+    content_layers = [21]  # VGG conv4_2
+    style_layers = [0, 5, 10, 19, 28]  # VGG conv1_1, conv2_1, conv3_1, conv4_1, conv5_1
+
+    # Get features from the VGG model
+    vgg_features = VGG_Features(style_layers, content_layers).to(device)
+    
+    # Get initial features for style and content
+    style_features, _ = vgg_features(style_img)
+    _, content_features = vgg_features(content_img)
+
+    # Use L-BFGS optimizer for faster convergence
+    optimizer = optim.LBFGS([generated_img])
+    
+    print("Starting Neural Style Transfer...")
+    
+    run = [0]
+    while run[0] <= num_steps:
+        def closure():
+            # Zero gradients
+            optimizer.zero_grad()
+            
+            # Get features of the generated image
+            gen_style_features, gen_content_features = vgg_features(generated_img)
+            
+            # Calculate content loss
+            content_loss = torch.mean((gen_content_features[0] - content_features[0])**2)
+            
+            # Calculate style loss
+            style_loss = 0
+            for gen_feat, style_feat in zip(gen_style_features, style_features):
+                gen_gram = gram_matrix(gen_feat)
+                style_gram = gram_matrix(style_feat)
+                style_loss += torch.mean((gen_gram - style_gram)**2)
+            
+            # Calculate total loss
+            total_loss = content_weight * content_loss + style_weight * style_loss
+            
+            # Backpropagate
+            total_loss.backward()
+            
+            # Print progress
+            run[0] += 1
+            if run[0] % 50 == 0:
+                print(f"Step {run[0]}: Total Loss: {total_loss.item():.4f}")
+                
+            return total_loss
+        
+        optimizer.step(closure)
+    
+    # Post-process and save the final image
+    save_image(generated_img.cpu(), "stylized_output.png")
+    
+    print("\nNeural Style Transfer complete! The result is saved as 'stylized_output.png'")
+    
+def save_image(tensor, filename):
+    """Converts a tensor to an image and saves it."""
+    unloader = transforms.ToPILImage()
+    image = tensor.squeeze(0)
+    image = unloader(image)
+    image.save(filename)
+
+
+if __name__ == "__main__":
+    # --- Example Usage ---
+    # 1. Create a content image (e.g., a photo) and a style image (e.g., a painting).
+    #    Place them in the same directory as this script.
+    # 2. Update the file paths below.
+    
+    content_image_path = "content.jpg"
+    style_image_path = "style.jpg"
+    
+    # Check if images exist before running
+    if not os.path.exists(content_image_path):
+        print(f"Error: Content image not found at '{content_image_path}'")
+    elif not os.path.exists(style_image_path):
+        print(f"Error: Style image not found at '{style_image_path}'")
+    else:
+        style_transfer(content_image_path, style_image_path)
